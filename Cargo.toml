@@ -1,0 +1,27 @@
+[package]
+name = "portsnap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 命令行参数解析
+clap = { version = "4.4", features = ["derive"] }
+# 序列化 (为后续 JSON 输出做准备)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# 获取网络套接字信息 (底层调用 Windows IPHLPAPI)
+netstat2 = "0.9"
+# 获取系统进程信息 (用于 PID -> 进程名)
+sysinfo = "0.30"
+# 终端表格/彩色输出优化
+colored = "2.0"
+# 错误处理
+anyhow = "1.0"
+
+# 生产环境编译配置
+[profile.release]
+opt-level = "z"     # 优化级别："z" 代表为体积优化 (Size)，"s" 也是体积优化但稍微兼顾速度
+lto = true          # 开启链接时优化 (Link Time Optimization)，这会大幅减少死代码，但编译变慢
+codegen-units = 1   # 降低并行代码生成单元，虽然慢但优化效果最好
+panic = "abort"     # 发生 panic 时直接退出，不进行栈展开 (Unwind)，省去大量元数据
+strip = true        # 自动剥离符号表 (相当于运行 strip 命令)，Rust 1.59+ 支持
