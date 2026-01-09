@@ -9,14 +9,21 @@ clap = { version = "4.4", features = ["derive"] }
 # 序列化 (为后续 JSON 输出做准备)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# 获取网络套接字信息 (底层调用 Windows IPHLPAPI)
-netstat2 = "0.9"
 # 获取系统进程信息 (用于 PID -> 进程名)
 sysinfo = "0.30"
 # 终端表格/彩色输出优化
 colored = "2.0"
 # 错误处理
 anyhow = "1.0"
+# Windows 专用依赖
+[target.'cfg(windows)'.dependencies]
+netstat2 = "0.9"
+# Linux 专用依赖 (读取 /proc/net/tcp 原生方式，稳健且快)
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = "0.16"
+# macOS 专用依赖 (用于解析 lsof 输出)
+[target.'cfg(target_os = "macos")'.dependencies]
+regex = "1.10"
 
 # 生产环境编译配置
 [profile.release]
