@@ -107,15 +107,23 @@ mod linux_impl {
     }
 
     // 这是一个昂贵的操作，但在 Linux 不用 root 只能这么做
+    // 这是一个昂贵的操作，但在 Linux 不用 root 只能这么做
     fn find_pid_by_inode(target_inode: u64) -> Option<u32> {
         use procfs::process::all_processes;
         if let Ok(procs) = all_processes() {
-            for p in procs {
-                if let Ok(fds) = p.fd() {
-                    for fd in fds {
-                        if let procfs::process::FDTarget::Socket(inode) = fd.target {
-                            if inode == target_inode {
-                                return Some(p.pid as u32);
+            for p_res in procs {
+                // 修复点：p_res 是 Result<Process>，必须先解包
+                // 如果进程无法读取（比如刚退出或权限不足），直接跳过
+                if let Ok(p) = p_res {
+                    if let Ok(fds) = p.fd() {
+                        for fd in fds {
+                            // fd 也是一个 Result (可能 broken symlink)，这里需要处理
+                            if let Ok(fd_info) = fd {
+                                if let procfs::process::FDTarget::Socket(inode) = fd_info.target {
+                                    if inode == target_inode {
+                                        return Some(p.pid as u32);
+                                    }
+                                }
                             }
                         }
                     }
