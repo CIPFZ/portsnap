@@ -19,7 +19,7 @@
 ## 📥 安装指南
 
 ### 方式 1：下载二进制文件 (推荐)
-请前往 [Releases 页面](https://github.com/YOUR_USERNAME/portsnap/releases) 下载适用于 Windows、Linux 或 macOS 的最新版本。
+请前往 [Releases 页面](https://github.com/CIPFZ/portsnap/releases) 下载适用于 Windows、Linux 或 macOS 的最新版本。
 
 ### 方式 2：从源码编译
 如果你本地已安装 Rust 环境：
