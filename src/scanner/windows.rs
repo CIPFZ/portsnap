@@ -1,77 +1,400 @@
-use crate::model::{Protocol, SocketInfo};
-use anyhow::Result;
-use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo};
-use std::collections::HashMap;
-use sysinfo::System; // 修正1: 移除了 ProcessExt, SystemExt
+use crate::model::{
+    OwnershipStatus, ProcessInfo, Protocol, ScanOptions, ScanReport, SocketInfo, TcpState,
+};
+use anyhow::{anyhow, bail, Context, Result};
+use std::{
+    mem::{offset_of, size_of},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
+use windows_sys::Win32::{
+    Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
+    NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID,
+        MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
+        TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
+    },
+    Networking::WinSock::{AF_INET, AF_INET6},
+};
 
-pub(crate) struct Scanner;
+pub(super) fn scan(options: &ScanOptions) -> Result<ScanReport> {
+    super::scan_with_verified_owners(|| snapshot(options), crate::process::inspect)
+}
 
-impl Scanner {
-    /// 核心方法：扫描并返回结构化数据
-    pub fn scan(ports_filter: Option<&[u16]>) -> Result<Vec<SocketInfo>> {
-        // 1. 获取系统进程快照 (PID -> Name)
-        let mut sys = System::new();
-        sys.refresh_processes();
-
-        // 修正1: sysinfo 0.30+ 不需要 trait，直接调用方法
-        // 注意: sysinfo 的 pid 现在是 struct wrapper，需要转换为 u32
-        let process_map: HashMap<u32, String> = sys
-            .processes()
-            .iter()
-            .map(|(pid, process)| (pid.as_u32(), process.name().to_string()))
-            .collect();
-
-        // 2. 配置扫描参数
-        let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
-        let proto_flags = ProtocolFlags::TCP | ProtocolFlags::UDP;
-
-        // 3. 调用底层 API 获取 Socket 信息
-        let sockets = get_sockets_info(af_flags, proto_flags)?;
-        let mut results = Vec::new();
-
-        for si in sockets {
-            // 修正2: 优化逻辑，一次性解构 Protocol, Addr, Port
-            // 使用引用 &si.protocol_socket_info 避免所有权被 move
-            let (protocol, local_addr, local_port) = match &si.protocol_socket_info {
-                ProtocolSocketInfo::Tcp(tcp_info) => {
-                    (Protocol::TCP, tcp_info.local_addr, tcp_info.local_port)
-                }
-                ProtocolSocketInfo::Udp(udp_info) => {
-                    (Protocol::UDP, udp_info.local_addr, udp_info.local_port)
-                }
-            };
-
-            // 过滤逻辑
-            if let Some(ports) = ports_filter {
-                if !ports.contains(&local_port) {
-                    continue;
+fn snapshot(options: &ScanOptions) -> Result<ScanReport> {
+    let mut report = ScanReport::new();
+    let mut successful_tables = 0;
+    for (protocol, family, source) in [
+        (Protocol::Tcp, AF_INET, "TCP IPv4"),
+        (Protocol::Tcp, AF_INET6, "TCP IPv6"),
+        (Protocol::Udp, AF_INET, "UDP IPv4"),
+        (Protocol::Udp, AF_INET6, "UDP IPv6"),
+    ] {
+        match table(protocol, family) {
+            Ok(sockets) => {
+                successful_tables += 1;
+                for socket in sockets.into_iter().filter(|socket| options.matches(socket)) {
+                    if socket.ownership == OwnershipStatus::Unavailable {
+                        report.warn(
+                            source,
+                            format!("owner unavailable for local port {}", socket.local_port),
+                        );
+                    }
+                    if socket.state == Some(TcpState::Unknown) {
+                        report.warn(
+                            source,
+                            format!(
+                                "unrecognized TCP state for local port {}",
+                                socket.local_port
+                            ),
+                        );
+                    }
+                    report.sockets.push(socket);
                 }
             }
-
-            // 获取 PID
-            let pid = si.associated_pids.first().cloned().unwrap_or(0);
-
-            // 查找进程名
-            let process_name = process_map.get(&pid).cloned().unwrap_or_else(|| {
-                if pid == 0 {
-                    "System".to_string()
-                } else {
-                    "Unknown".to_string()
-                }
-            });
-
-            results.push(SocketInfo {
-                protocol,
-                local_addr: local_addr.to_string(),
-                local_port,
-                pid,
-                process_name,
-            });
+            Err(error) => report.warn(source, error.to_string()),
         }
+    }
+    if successful_tables == 0 {
+        bail!(
+            "all Windows socket tables failed: {}",
+            report
+                .warnings
+                .iter()
+                .map(|warning| format!("{}: {}", warning.source, warning.message))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    Ok(report)
+}
 
-        // 排序
-        results.sort_by_key(|k| k.local_port);
+fn table(protocol: Protocol, family: u16) -> Result<Vec<SocketInfo>> {
+    let (buffer, byte_len) = read_table(|pointer, size| {
+        // SAFETY: read_table supplies a null size-probe pointer or an aligned
+        // writable allocation with at least *size bytes, alive for this call.
+        unsafe {
+            match protocol {
+                Protocol::Tcp => GetExtendedTcpTable(
+                    pointer,
+                    size,
+                    0,
+                    u32::from(family),
+                    TCP_TABLE_OWNER_PID_ALL,
+                    0,
+                ),
+                Protocol::Udp => {
+                    GetExtendedUdpTable(pointer, size, 0, u32::from(family), UDP_TABLE_OWNER_PID, 0)
+                }
+            }
+        }
+    })?;
+    // SAFETY: each API/table class is paired with its Windows SDK row type.
+    // These repr(C) rows contain only integer fields and byte arrays; every bit
+    // pattern is valid. decode_rows validates every offset before reading.
+    unsafe {
+        match (protocol, family) {
+            (Protocol::Tcp, AF_INET) => Ok(decode_rows::<MIB_TCPROW_OWNER_PID>(
+                &buffer,
+                byte_len,
+                offset_of!(MIB_TCPTABLE_OWNER_PID, table),
+            )?
+            .into_iter()
+            .map(tcp4)
+            .collect()),
+            (Protocol::Tcp, AF_INET6) => Ok(decode_rows::<MIB_TCP6ROW_OWNER_PID>(
+                &buffer,
+                byte_len,
+                offset_of!(MIB_TCP6TABLE_OWNER_PID, table),
+            )?
+            .into_iter()
+            .map(tcp6)
+            .collect()),
+            (Protocol::Udp, AF_INET) => Ok(decode_rows::<MIB_UDPROW_OWNER_PID>(
+                &buffer,
+                byte_len,
+                offset_of!(MIB_UDPTABLE_OWNER_PID, table),
+            )?
+            .into_iter()
+            .map(udp4)
+            .collect()),
+            (Protocol::Udp, AF_INET6) => Ok(decode_rows::<MIB_UDP6ROW_OWNER_PID>(
+                &buffer,
+                byte_len,
+                offset_of!(MIB_UDP6TABLE_OWNER_PID, table),
+            )?
+            .into_iter()
+            .map(udp6)
+            .collect()),
+            _ => bail!("unsupported Windows address family {family}"),
+        }
+    }
+}
 
-        Ok(results)
+fn read_table(
+    mut query: impl FnMut(*mut std::ffi::c_void, &mut u32) -> u32,
+) -> Result<(Vec<u64>, usize)> {
+    let mut size = 0;
+    let status = query(std::ptr::null_mut(), &mut size);
+    if status != ERROR_INSUFFICIENT_BUFFER && status != NO_ERROR {
+        return Err(std::io::Error::from_raw_os_error(status as i32).into());
+    }
+    for _ in 0..4 {
+        if size < size_of::<u32>() as u32 {
+            bail!("Windows returned an invalid socket table size {size}");
+        }
+        let capacity = (size as usize).div_ceil(size_of::<u64>());
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(capacity)
+            .context("cannot allocate Windows socket table")?;
+        buffer.resize(capacity, 0_u64);
+        let status = query(buffer.as_mut_ptr().cast(), &mut size);
+        if status == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+        if status != NO_ERROR {
+            return Err(std::io::Error::from_raw_os_error(status as i32).into());
+        }
+        if size as usize > buffer.len() * size_of::<u64>() {
+            bail!("Windows returned a table larger than its allocation");
+        }
+        return Ok((buffer, size as usize));
+    }
+    bail!("Windows socket table kept growing during the scan; retry the query")
+}
+
+/// T must be the SDK integer-only row type associated with the requested table.
+unsafe fn decode_rows<T: Copy>(buffer: &[u64], byte_len: usize, offset: usize) -> Result<Vec<T>> {
+    if byte_len < size_of::<u32>() || byte_len > std::mem::size_of_val(buffer) {
+        bail!("truncated Windows socket table header");
+    }
+    // SAFETY: the bounds above include a full u32, and unaligned reads do not
+    // assume the alignment of the byte offset into the native table.
+    let pointer = buffer.as_ptr().cast::<u8>();
+    let count = unsafe { pointer.cast::<u32>().read_unaligned() } as usize;
+    let rows_len = count
+        .checked_mul(size_of::<T>())
+        .and_then(|len| offset.checked_add(len))
+        .ok_or_else(|| anyhow!("Windows socket table row count overflow"))?;
+    if rows_len > byte_len {
+        bail!("truncated Windows socket table rows");
+    }
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        // SAFETY: rows_len validates the entire range; the caller guarantees
+        // the concrete row type's layout and that all bit patterns are valid.
+        rows.push(unsafe {
+            pointer
+                .add(offset + index * size_of::<T>())
+                .cast::<T>()
+                .read_unaligned()
+        });
+    }
+    Ok(rows)
+}
+
+fn owner_socket(
+    protocol: Protocol,
+    addr: IpAddr,
+    scope: Option<String>,
+    port: u32,
+    pid: u32,
+) -> SocketInfo {
+    SocketInfo {
+        protocol,
+        local_addr: addr,
+        local_scope: scope,
+        local_port: u16::from_be(port as u16),
+        remote_addr: None,
+        remote_scope: None,
+        remote_port: None,
+        state: None,
+        owners: if pid == 0 {
+            Vec::new()
+        } else {
+            vec![ProcessInfo {
+                pid,
+                name: None,
+                identity: None,
+            }]
+        },
+        ownership: if pid == 0 {
+            OwnershipStatus::Unavailable
+        } else {
+            OwnershipStatus::Complete
+        },
+    }
+}
+
+fn tcp4(row: MIB_TCPROW_OWNER_PID) -> SocketInfo {
+    let mut socket = owner_socket(
+        Protocol::Tcp,
+        Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()).into(),
+        None,
+        row.dwLocalPort,
+        row.dwOwningPid,
+    );
+    tcp_details(
+        &mut socket,
+        Ipv4Addr::from(row.dwRemoteAddr.to_ne_bytes()).into(),
+        None,
+        row.dwRemotePort,
+        row.dwState,
+    );
+    socket
+}
+
+fn tcp6(row: MIB_TCP6ROW_OWNER_PID) -> SocketInfo {
+    let mut socket = owner_socket(
+        Protocol::Tcp,
+        Ipv6Addr::from(row.ucLocalAddr).into(),
+        scope(row.dwLocalScopeId),
+        row.dwLocalPort,
+        row.dwOwningPid,
+    );
+    tcp_details(
+        &mut socket,
+        Ipv6Addr::from(row.ucRemoteAddr).into(),
+        scope(row.dwRemoteScopeId),
+        row.dwRemotePort,
+        row.dwState,
+    );
+    socket
+}
+
+fn udp4(row: MIB_UDPROW_OWNER_PID) -> SocketInfo {
+    owner_socket(
+        Protocol::Udp,
+        Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes()).into(),
+        None,
+        row.dwLocalPort,
+        row.dwOwningPid,
+    )
+}
+
+fn udp6(row: MIB_UDP6ROW_OWNER_PID) -> SocketInfo {
+    owner_socket(
+        Protocol::Udp,
+        Ipv6Addr::from(row.ucLocalAddr).into(),
+        scope(row.dwLocalScopeId),
+        row.dwLocalPort,
+        row.dwOwningPid,
+    )
+}
+
+fn scope(value: u32) -> Option<String> {
+    (value != 0).then(|| value.to_string())
+}
+
+fn tcp_details(
+    socket: &mut SocketInfo,
+    remote_addr: IpAddr,
+    remote_scope: Option<String>,
+    remote_port: u32,
+    state: u32,
+) {
+    let state = match state {
+        1 => TcpState::Closed,
+        2 => TcpState::Listen,
+        3 => TcpState::SynSent,
+        4 => TcpState::SynReceived,
+        5 => TcpState::Established,
+        6 => TcpState::FinWait1,
+        7 => TcpState::FinWait2,
+        8 => TcpState::CloseWait,
+        9 => TcpState::Closing,
+        10 => TcpState::LastAck,
+        11 => TcpState::TimeWait,
+        12 => TcpState::DeleteTcb,
+        _ => TcpState::Unknown,
+    };
+    socket.state = Some(state);
+    // Remote fields in a LISTEN row are undefined in the Windows API.
+    if state != TcpState::Listen {
+        socket.remote_addr = Some(remote_addr);
+        socket.remote_scope = remote_scope;
+        socket.remote_port = Some(u16::from_be(remote_port as u16));
+    }
+    if socket.owners.is_empty() && state == TcpState::TimeWait {
+        socket.ownership = OwnershipStatus::NotApplicable;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_native_addresses_ports_scopes_and_states() {
+        let socket = tcp4(MIB_TCPROW_OWNER_PID {
+            dwState: 2,
+            dwLocalAddr: u32::from_ne_bytes([127, 0, 0, 1]),
+            dwLocalPort: 8080_u16.to_be().into(),
+            dwRemoteAddr: 99,
+            dwRemotePort: 99,
+            dwOwningPid: 12,
+        });
+        assert_eq!(socket.local_addr, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(socket.local_port, 8080);
+        assert_eq!(socket.state, Some(TcpState::Listen));
+        assert_eq!(socket.remote_addr, None);
+        let socket = tcp6(MIB_TCP6ROW_OWNER_PID {
+            ucLocalAddr: "fe80::1".parse::<Ipv6Addr>().unwrap().octets(),
+            dwLocalScopeId: 7,
+            dwLocalPort: 5353_u16.to_be().into(),
+            ucRemoteAddr: "fe80::2".parse::<Ipv6Addr>().unwrap().octets(),
+            dwRemoteScopeId: 8,
+            dwRemotePort: 53_u16.to_be().into(),
+            dwState: 5,
+            dwOwningPid: 12,
+        });
+        assert_eq!(socket.local_scope.as_deref(), Some("7"));
+        assert_eq!(socket.remote_scope.as_deref(), Some("8"));
+        assert_eq!(socket.remote_port, Some(53));
+        assert_eq!(socket.state, Some(TcpState::Established));
+    }
+
+    #[test]
+    fn no_owner_in_time_wait_is_not_a_fake_pid() {
+        let socket = tcp4(MIB_TCPROW_OWNER_PID {
+            dwState: 11,
+            dwLocalAddr: 0,
+            dwLocalPort: 1,
+            dwRemoteAddr: 0,
+            dwRemotePort: 1,
+            dwOwningPid: 0,
+        });
+        assert!(socket.owners.is_empty());
+        assert_eq!(socket.ownership, OwnershipStatus::NotApplicable);
+    }
+
+    #[test]
+    fn native_table_decoder_rejects_truncated_rows() {
+        let buffer = [10_u64];
+        // SAFETY: the row is an integer-only SDK type; deliberately short data
+        // must fail bounds validation before any row is read.
+        assert!(unsafe { decode_rows::<MIB_TCPROW_OWNER_PID>(&buffer, 8, 4) }.is_err());
+        assert!(unsafe { decode_rows::<MIB_TCPROW_OWNER_PID>(&buffer, 3, 4) }.is_err());
+    }
+
+    #[test]
+    fn retries_growing_tables_and_propagates_errors() {
+        let mut calls = 0;
+        let (buffer, len) = read_table(|pointer, size| {
+            calls += 1;
+            if calls <= 2 {
+                *size = 8;
+                return ERROR_INSUFFICIENT_BUFFER;
+            }
+            assert!(!pointer.is_null());
+            *size = 8;
+            NO_ERROR
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(len, 8);
+        assert_eq!(buffer, [0]);
+        assert!(read_table(|_, _| 5).is_err());
     }
 }

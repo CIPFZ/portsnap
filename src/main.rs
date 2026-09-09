@@ -1,147 +1,256 @@
-mod killer;
-mod model;
-mod scanner;
-
-use clap::Parser;
-use colored::*;
-use killer::Killer;
-use scanner::Scanner;
-use std::collections::HashSet;
-use std::io::{self, Write};
-use std::process;
+use anyhow::{bail, Context, Result};
+use clap::{ArgGroup, Parser};
+use portsnap::{
+    killer::{KillError, KillOutcome, PreparedTarget},
+    model::{ProcessInfo, ScanOptions, ScanReport},
+    output,
+    scanner::Scanner,
+};
+use std::{
+    collections::BTreeMap,
+    io::{self, BufRead, Write},
+    process::ExitCode,
+    time::Duration,
+};
 
 #[derive(Parser, Debug)]
-#[command(name = "portsnap")]
-#[command(about = "Quickly check port usage", long_about = None)]
+#[command(
+    name = "portsnap",
+    version,
+    about = "Inspect local TCP and UDP endpoints and their owners"
+)]
+#[command(group(ArgGroup::new("query").args(["ports", "list"]).required(true)))]
 struct Args {
-    /// Specific ports to check (e.g., 8080 3000)
-    #[arg(num_args = 1..)] // 支持接收 1 个或多个参数
+    /// Local ports to inspect, including non-listening TCP states
+    #[arg(num_args=1.., value_parser=clap::value_parser!(u16).range(1..))]
     ports: Vec<u16>,
-
-    /// List all listening ports
-    #[arg(long, short = 'l')]
+    /// List TCP listeners and bound UDP endpoints
+    #[arg(short = 'l', long, conflicts_with = "ports")]
     list: bool,
-
-    /// Output in JSON format
-    #[arg(long)]
+    /// Emit one versioned JSON scan report
+    #[arg(long, conflicts_with = "kill")]
     json: bool,
-
-    /// Kill the process occupying the port (Interactive)
-    #[arg(short = 'k', long = "kill")]
+    /// Interactively terminate owning processes (Windows: forced termination)
+    #[arg(short='k', long="kill", requires="ports", conflicts_with_all=["list", "json"])]
     kill: bool,
+    /// Force termination; required for macOS (subject to task-port permissions)
+    #[arg(long, requires = "kill")]
+    force: bool,
+    /// Seconds to wait for each process to exit, without automatic escalation
+    #[arg(long, default_value_t=3, value_parser=clap::value_parser!(u64).range(1..=60), requires="kill")]
+    timeout: u64,
 }
 
-fn main() {
-    let args = Args::parse();
-
-    // 1. 安全检查：Kill 模式必须指定端口，不能配合 --list 使用（防止误杀全家）
-    if args.kill && (args.ports.is_empty() || args.list) {
-        eprintln!(
-            "{} {}",
-            "Safety Error:".red().bold(),
-            "--kill requires specific ports (e.g., 'portsnap 8080 -k'). Do not use with --list."
-        );
-        process::exit(1);
-    }
-
-    // 2. 确定扫描范围
-    let filter = if args.ports.is_empty() {
-        if args.list {
-            None // 查全部
-        } else {
-            // 既没指定端口，也没加 --list，显示帮助并退出
-            use clap::CommandFactory;
-            Args::command().print_help().unwrap();
-            return;
+fn main() -> ExitCode {
+    match run(Args::parse()) {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)
+                || error
+                    .downcast_ref::<serde_json::Error>()
+                    .is_some_and(|e| e.io_error_kind() == Some(io::ErrorKind::BrokenPipe))
+            {
+                return ExitCode::SUCCESS;
+            }
+            eprintln!("Error: {error:#}");
+            ExitCode::FAILURE
         }
-    } else {
-        Some(args.ports.as_slice())
+    }
+}
+
+fn run(args: Args) -> Result<u8> {
+    #[cfg(target_os = "macos")]
+    if args.kill && !args.force {
+        bail!("safe termination on macOS requires --force and permission to acquire a Mach task port; ordinary PID-based signals are not used");
+    }
+    let options = ScanOptions {
+        ports: args.ports,
+        listening_only: args.list,
     };
-
-    if !args.json {
-        println!("{}", "Scanning ports...".dimmed());
+    let report = Scanner::scan(&options).context("scan failed")?;
+    if args.json {
+        let mut out = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &report).context("write JSON report")?;
+        writeln!(out)?;
+    } else {
+        output::write_text(io::stdout().lock(), &report)?;
     }
+    output::write_warnings(io::stderr().lock(), &report)?;
+    if args.kill && !report.sockets.is_empty() {
+        return kill_interactively(
+            &report,
+            &options,
+            args.force,
+            Duration::from_secs(args.timeout),
+        );
+    }
+    Ok(if report.complete { 0 } else { 3 })
+}
 
-    // 3. 执行扫描
-    match Scanner::scan(filter) {
-        Ok(results) => {
-            if results.is_empty() {
-                if args.json {
-                    println!("[]");
-                } else {
-                    println!("{}", "No matching ports found.".yellow());
-                }
-                return;
-            }
-
-            // 4. 输出结果 (JSON 或 表格)
-            if args.json {
-                match serde_json::to_string_pretty(&results) {
-                    Ok(json) => println!("{}", json),
-                    Err(e) => eprintln!("{} {}", "Serialization Error:".red(), e),
-                }
-            } else {
-                // 表格表头
-                println!(
-                    "{:<6} {:<25} {:<10} {}",
-                    "PROTO".bold(),
-                    "LOCAL ADDRESS".bold(),
-                    "PID".bold(),
-                    "PROCESS".bold()
+fn targets(report: &ScanReport) -> Result<Vec<ProcessInfo>> {
+    let mut owners = BTreeMap::<u32, ProcessInfo>::new();
+    for owner in report.sockets.iter().flat_map(|socket| &socket.owners) {
+        if let Some(previous) = owners.get(&owner.pid) {
+            if previous.identity != owner.identity {
+                bail!(
+                    "process {} changed identity during the scan; run the query again",
+                    owner.pid
                 );
-                for item in results.iter() {
-                    println!("{}", item.to_text_row());
-                }
             }
+        } else {
+            owners.insert(owner.pid, owner.clone());
+        }
+    }
+    Ok(owners.into_values().collect())
+}
 
-            // 5. Kill 交互逻辑
-            if args.kill {
-                println!(); // 空一行分隔
-                println!("{}", "--- Interactive Kill Mode ---".red().bold());
-
-                // 用于记录已经处理过的 PID，防止同一个进程占两个端口被问两次
-                let mut processed_pids = HashSet::new();
-
-                for item in results {
-                    // 跳过 PID 0 (System) 和 已经处理过的 PID
-                    if item.pid == 0 || processed_pids.contains(&item.pid) {
-                        continue;
-                    }
-
-                    // 标记该 PID 已处理
-                    processed_pids.insert(item.pid);
-
-                    // 交互提示
-                    print!(
-                        "Kill process '{}' (PID {})? [y/N]: ",
-                        item.process_name.bold(),
-                        item.pid.to_string().yellow()
-                    );
-                    io::stdout().flush().unwrap(); // 强制刷新缓冲区，确保提示显示
-
-                    // 读取用户输入
-                    let mut input = String::new();
-                    if io::stdin().read_line(&mut input).is_ok() {
-                        let choice = input.trim().to_lowercase();
-                        if choice == "y" || choice == "yes" {
-                            if Killer::kill(item.pid) {
-                                println!("  {} Process terminated.", "✔".green());
-                            } else {
-                                println!(
-                                    "  {} Failed to kill process (Access Denied or Exited).",
-                                    "✘".red()
-                                );
-                            }
-                        } else {
-                            println!("  {} Skipped.", "-".dimmed());
-                        }
-                    }
-                }
+fn kill_interactively(
+    report: &ScanReport,
+    options: &ScanOptions,
+    force: bool,
+    timeout: Duration,
+) -> Result<u8> {
+    let owners = targets(report)?;
+    if owners.is_empty() {
+        bail!("no safely identifiable process owns the observed endpoints; inspect ownership warnings or kernel-managed TCP states");
+    }
+    let mut failed = false;
+    let mut attempted = false;
+    let mut incomplete = !report.complete;
+    let mut input = io::stdin().lock();
+    for owner in owners {
+        // Acquire a stable OS reference before allowing an unbounded confirmation delay.
+        let mut target = match PreparedTarget::prepare(&owner) {
+            Ok(target) => target,
+            Err(KillError::AlreadyExited) => {
+                eprintln!("PID {} already exited.", owner.pid);
+                attempted = true;
+                continue;
+            }
+            Err(error) => {
+                eprintln!("Cannot prepare PID {}: {error}", owner.pid);
+                failed = true;
+                continue;
+            }
+        };
+        let name = owner.name.as_deref().unwrap_or("name unavailable");
+        eprint!(
+            "{} process {:?} (PID {})? [y/N]: ",
+            if force || cfg!(windows) {
+                "Force terminate"
+            } else {
+                "Terminate"
+            },
+            name,
+            owner.pid
+        );
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            bail!(
+                "confirmation input ended; no signal sent to PID {}",
+                owner.pid
+            );
+        }
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            eprintln!("Skipped PID {}.", owner.pid);
+            continue;
+        }
+        attempted = true;
+        // Process identity and port ownership are independent: verify both.
+        let current =
+            Scanner::scan(options).context("cannot recheck port ownership before termination")?;
+        incomplete |= !current.complete;
+        output::write_warnings(io::stderr().lock(), &current)?;
+        let still_owns = current
+            .sockets
+            .iter()
+            .flat_map(|socket| &socket.owners)
+            .any(|candidate| {
+                candidate.pid == owner.pid
+                    && candidate.identity.is_some()
+                    && candidate.identity == owner.identity
+            });
+        if !still_owns {
+            if !current.complete {
+                eprintln!(
+                    "Cannot verify that PID {} still owns a requested endpoint; no signal sent.",
+                    owner.pid
+                );
+                failed = true;
+            } else {
+                eprintln!(
+                    "PID {} no longer owns a requested endpoint; no signal sent.",
+                    owner.pid
+                );
+            }
+            continue;
+        }
+        match target.terminate(force, timeout) {
+            Ok(KillOutcome::Exited) => eprintln!("PID {} exited (verified).", owner.pid),
+            Ok(KillOutcome::AlreadyExited) => eprintln!("PID {} already exited.", owner.pid),
+            Err(error) => {
+                eprintln!("Failed to terminate PID {}: {error}", owner.pid);
+                failed = true;
             }
         }
-        Err(e) => {
-            eprintln!("{} {}", "Error:".red().bold(), e);
-            process::exit(1);
+    }
+    if attempted {
+        let remaining = Scanner::scan(options).context("cannot verify remaining endpoints")?;
+        incomplete |= !remaining.complete;
+        output::write_warnings(io::stderr().lock(), &remaining)?;
+        if remaining.sockets.is_empty() {
+            if remaining.complete {
+                eprintln!("No matching endpoints remain.");
+            } else {
+                eprintln!(
+                    "No matching endpoints observed; the incomplete scan cannot confirm release."
+                );
+            }
+        } else {
+            eprintln!("Matching endpoints remain; review their current owners and TCP states:");
+            output::write_text(io::stdout().lock(), &remaining)?;
+            failed = true;
+        }
+    }
+    Ok(if failed {
+        1
+    } else if incomplete {
+        3
+    } else {
+        0
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn incompatible_and_incomplete_cli_requests_are_rejected() {
+        for args in [
+            vec!["portsnap"],
+            vec!["portsnap", "--json"],
+            vec!["portsnap", "--kill"],
+            vec!["portsnap", "80", "--list"],
+            vec!["portsnap", "80", "--kill", "--json"],
+            vec!["portsnap", "80", "--force"],
+            vec!["portsnap", "0"],
+            vec!["portsnap", "65536"],
+            vec!["portsnap", "80", "--timeout", "0"],
+        ] {
+            assert!(Args::try_parse_from(&args).is_err(), "{args:?}");
+        }
+    }
+    #[test]
+    fn queries_do_not_require_kill_despite_default_timeout() {
+        for args in [
+            vec!["portsnap", "80", "443"],
+            vec!["portsnap", "-l", "--json"],
+            vec!["portsnap", "80", "-k", "--force", "--timeout", "1"],
+        ] {
+            assert!(Args::try_parse_from(&args).is_ok(), "{args:?}");
         }
     }
 }

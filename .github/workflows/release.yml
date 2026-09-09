@@ -1,89 +1,84 @@
 name: Release
 
-permissions:
-  contents: write
-
 on:
   push:
-    tags:
-      - "v*" # 仅当推送 v 开头的 tag 时触发 (如 v0.1.0)
+    tags: ['v*']
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Build - ${{ matrix.platform.os_name }}
-    runs-on: ${{ matrix.platform.os }}
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        platform:
-          - os_name: Linux
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin_name: portsnap
-            name: portsnap-linux-amd64
-          - os_name: Windows
-            os: windows-latest
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            binary: portsnap
+          - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin_name: portsnap.exe
-            name: portsnap-windows-amd64.exe
-          - os_name: macOS
-            os: macos-latest
+            binary: portsnap.exe
+          - os: macos-15-intel
             target: x86_64-apple-darwin
-            bin_name: portsnap
-            name: portsnap-darwin-amd64
-
+            binary: portsnap
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: portsnap
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform.target }}
-
-      - name: Build Binary
-        run: cargo build --release --target ${{ matrix.platform.target }}
-
-      - name: Rename Binary
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Verify tag matches Cargo version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python -c 'import os,tomllib; v=tomllib.load(open("Cargo.toml","rb"))["package"]["version"]; assert os.environ["RELEASE_TAG"] == "v" + v, "tag must match Cargo.toml version"'
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+      - run: cargo test --locked --all-targets --target ${{ matrix.target }}
+      - run: python -m unittest discover -s scripts -p 'test_*.py'
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Archive binary and checksum
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         shell: bash
         run: |
-          cp target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin_name }} ${{ matrix.platform.name }}
-
-      - name: Generate MD5
-        shell: bash
-        run: |
-          md5sum ${{ matrix.platform.name }} > ${{ matrix.platform.name }}.md5
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+          python scripts/package_release.py --binary 'target/${{ matrix.target }}/release/${{ matrix.binary }}' --target '${{ matrix.target }}' --version "$RELEASE_TAG" --output dist
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform.name }}
-          path: |
-            ${{ matrix.platform.name }}
-            ${{ matrix.platform.name }}.md5
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
   release:
-    name: Create Release
+    name: Publish verified archives
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
-
-      - name: Display structure of downloaded files
-        run: ls -R
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - uses: actions/download-artifact@v4
         with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
           files: |
-            portsnap-linux-amd64/portsnap-linux-amd64
-            portsnap-linux-amd64/portsnap-linux-amd64.md5
-            portsnap-windows-amd64.exe/portsnap-windows-amd64.exe
-            portsnap-windows-amd64.exe/portsnap-windows-amd64.exe.md5
-            portsnap-darwin-amd64/portsnap-darwin-amd64
-            portsnap-darwin-amd64/portsnap-darwin-amd64.md5
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256

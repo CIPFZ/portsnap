@@ -2,28 +2,27 @@
 name = "portsnap"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Inspect local TCP and UDP endpoints and their owning processes"
+repository = "https://github.com/CIPFZ/portsnap"
+rust-version = "1.85"
 
 [dependencies]
 # 命令行参数解析
 clap = { version = "4.4", features = ["derive"] }
-# 序列化 (为后续 JSON 输出做准备)
+# 结构化 JSON 报告
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# 获取系统进程信息 (用于 PID -> 进程名)
-sysinfo = "0.30"
-# 终端表格/彩色输出优化
-colored = "2.0"
 # 错误处理
 anyhow = "1.0"
 # Windows 专用依赖
 [target.'cfg(windows)'.dependencies]
-netstat2 = "0.9"
-# Linux 专用依赖 (读取 /proc/net/tcp 原生方式，稳健且快)
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Security", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+# Linux procfs 协议表解析
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.16"
-# macOS 专用依赖 (用于解析 lsof 输出)
-[target.'cfg(target_os = "macos")'.dependencies]
-regex = "1.10"
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # 生产环境编译配置
 [profile.release]
