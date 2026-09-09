@@ -1,5 +1,6 @@
 use crate::model::{OwnershipStatus, ScanReport, SocketInfo};
 use std::{
+    collections::BTreeMap,
     io::{self, Write},
     net::IpAddr,
 };
@@ -101,6 +102,92 @@ pub fn write_text(mut out: impl Write, report: &ScanReport) -> io::Result<()> {
             }
         }
     }
+    write_details(out, report)
+}
+
+fn write_details(mut out: impl Write, report: &ScanReport) -> io::Result<()> {
+    let owners: BTreeMap<_, _> = report
+        .sockets
+        .iter()
+        .flat_map(|socket| &socket.owners)
+        .filter(|owner| owner.details.is_some())
+        .map(|owner| ((owner.pid, owner.identity), owner))
+        .collect();
+    if owners.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "\nPROCESS DETAILS")?;
+    for owner in owners.into_values() {
+        let Some(details) = &owner.details else {
+            continue;
+        };
+        writeln!(
+            out,
+            "PID {} ({})",
+            owner.pid,
+            visible(owner.name.as_deref().unwrap_or("name unavailable"))
+        )?;
+        writeln!(
+            out,
+            "  Executable: {}",
+            details
+                .executable
+                .as_deref()
+                .map(visible)
+                .unwrap_or_else(|| "unavailable".into())
+        )?;
+        // JSON argument arrays preserve empty arguments, quoting and platform-specific paths.
+        let command = details
+            .command
+            .as_ref()
+            .map(|args| serde_json::to_string(args).map(|text| visible(&text)))
+            .transpose()
+            .map_err(io::Error::other)?;
+        writeln!(
+            out,
+            "  Arguments:  {}",
+            command.as_deref().unwrap_or("unavailable")
+        )?;
+        let user = details.user.as_ref().map(|user| match &user.name {
+            Some(name) => format!("{} ({})", visible(name), visible(&user.id)),
+            None => visible(&user.id),
+        });
+        writeln!(
+            out,
+            "  User:       {}",
+            user.as_deref().unwrap_or("unavailable")
+        )?;
+        writeln!(
+            out,
+            "  Parent PID: {}",
+            details
+                .parent_pid
+                .map(|pid| pid.to_string())
+                .as_deref()
+                .unwrap_or("unavailable")
+        )?;
+        let started = details.start_time_unix_ms.map(|millis| {
+            i64::try_from(millis)
+                .ok()
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                .unwrap_or_else(|| format!("{millis} ms since Unix epoch"))
+        });
+        writeln!(
+            out,
+            "  Started:    {}",
+            started.as_deref().unwrap_or("unavailable")
+        )?;
+        for warning in &details.warnings {
+            writeln!(
+                out,
+                "  Unavailable [{}; {}]: {}",
+                warning.field,
+                warning.code,
+                visible(&warning.message)
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -108,7 +195,8 @@ pub fn write_warnings(mut out: impl Write, report: &ScanReport) -> io::Result<()
     for warning in &report.warnings {
         writeln!(
             out,
-            "Warning [{}]: {}",
+            "Warning [{}; {}]: {}",
+            warning.code,
             visible(&warning.source),
             visible(&warning.message)
         )?;
@@ -122,7 +210,10 @@ pub fn write_warnings(mut out: impl Write, report: &ScanReport) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ProcessInfo, Protocol, TcpState};
+    use crate::model::{
+        DetailField, DiagnosticCode, ProcessDetails, ProcessIdentity, ProcessInfo, ProcessUser,
+        Protocol, TcpState,
+    };
     #[test]
     fn ipv6_scope_and_port_are_unambiguous() {
         assert_eq!(
@@ -147,11 +238,13 @@ mod tests {
                     pid: 123,
                     name: Some("one\x1b[31m".into()),
                     identity: None,
+                    details: None,
                 },
                 ProcessInfo {
                     pid: 456,
                     name: Some("two".into()),
                     identity: None,
+                    details: None,
                 },
             ],
             ownership: OwnershipStatus::Complete,
@@ -169,11 +262,76 @@ mod tests {
     #[test]
     fn empty_incomplete_report_does_not_claim_no_occupancy() {
         let mut report = ScanReport::new();
-        report.warn("tcp", "permission denied");
+        report.warn(
+            crate::model::DiagnosticCode::PermissionDenied,
+            "tcp",
+            "permission denied",
+        );
         let mut out = Vec::new();
         write_text(&mut out, &report).unwrap();
         assert!(String::from_utf8(out)
             .unwrap()
             .contains("scan is incomplete"));
+    }
+
+    #[test]
+    fn details_preserve_arguments_escape_external_text_and_deduplicate_shared_owners() {
+        let mut details = ProcessDetails::empty();
+        details.executable = Some("/tmp/a\x1b[31m\nprogram".into());
+        details.command = Some(vec![
+            "a program".into(),
+            "".into(),
+            "quoted \"word\"".into(),
+            "line\nnext".into(),
+        ]);
+        details.user = Some(ProcessUser {
+            id: "1000".into(),
+            name: Some("dev\tuser".into()),
+        });
+        details.start_time_unix_ms = Some(1_700_000_000_123);
+        details.warn(
+            DetailField::ParentPid,
+            DiagnosticCode::PermissionDenied,
+            "access\nrefused",
+        );
+        let socket = SocketInfo {
+            protocol: Protocol::Tcp,
+            local_addr: "127.0.0.1".parse().unwrap(),
+            local_port: 8080,
+            local_scope: None,
+            remote_addr: None,
+            remote_port: None,
+            remote_scope: None,
+            state: Some(TcpState::Listen),
+            owners: vec![ProcessInfo {
+                pid: 123,
+                name: Some("worker".into()),
+                identity: Some(ProcessIdentity {
+                    pid: 123,
+                    start_time: 999,
+                }),
+                details: Some(details),
+            }],
+            ownership: OwnershipStatus::Complete,
+        };
+        let mut report = ScanReport::new();
+        report.sockets = vec![
+            socket.clone(),
+            SocketInfo {
+                local_port: 8081,
+                ..socket
+            },
+        ];
+        let mut text = Vec::new();
+        write_text(&mut text, &report).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert_eq!(text.matches("PID 123 (worker)").count(), 1);
+        assert!(text.contains(r#"["a program","","quoted \"word\"","line\nnext"]"#));
+        assert!(text.contains("2023-11-14T22:13:20.123Z"));
+        assert!(text.contains("Parent PID: unavailable"));
+        assert!(text.contains(r"Unavailable [parent_pid; permission_denied]: access\nrefused"));
+        assert!(text.contains(r"dev\tuser (1000)"));
+        assert!(!text.contains('\x1b'));
+        assert!(!text.contains("\nprogram"));
     }
 }

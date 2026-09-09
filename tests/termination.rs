@@ -121,6 +121,7 @@ fn refuses_protected_missing_and_inconsistent_identity() {
             pid,
             name: None,
             identity: Some(ProcessIdentity { pid, start_time: 1 }),
+            details: None,
         };
         assert!(matches!(
             PreparedTarget::prepare(&info),

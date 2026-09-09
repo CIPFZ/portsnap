@@ -29,6 +29,14 @@ fn json_is_one_versioned_report_with_all_owners_and_typed_states() {
     assert_eq!(report["schema_version"], 1);
     assert!(report["complete"].is_boolean());
     assert!(report["warnings"].is_array());
+    for warning in report["warnings"].as_array().unwrap() {
+        assert!(warning["code"].is_string());
+    }
+    for row in report["sockets"].as_array().unwrap() {
+        for owner in row["owners"].as_array().unwrap() {
+            assert!(owner.get("details").is_none());
+        }
+    }
     for (port, protocol, state) in [(ports[0], "TCP", Some("LISTEN")), (ports[1], "UDP", None)] {
         let row = report["sockets"]
             .as_array()
@@ -58,6 +66,78 @@ fn invalid_json_kill_combination_fails_before_emitting_report() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn conflicting_filters_fail_before_emitting_a_report() {
+    for flags in [["--tcp", "--udp"], ["-4", "-6"], ["--ipv4", "--ipv6"]] {
+        let output = binary()
+            .args(["8080", "--json"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn protocol_and_family_filters_constrain_json_results() {
+    let tcp4 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let udp4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // IPv6 may be disabled on the host; IPv4 coverage still runs in that case.
+    let tcp6 = TcpListener::bind("[::1]:0").ok();
+    let udp6 = UdpSocket::bind("[::1]:0").ok();
+    let mut fixtures = vec![
+        (tcp4.local_addr().unwrap(), "TCP", "--tcp", "-4"),
+        (udp4.local_addr().unwrap(), "UDP", "--udp", "-4"),
+    ];
+    if let Some(socket) = &tcp6 {
+        fixtures.push((socket.local_addr().unwrap(), "TCP", "--tcp", "-6"));
+    }
+    if let Some(socket) = &udp6 {
+        fixtures.push((socket.local_addr().unwrap(), "UDP", "--udp", "-6"));
+    }
+    let ports: Vec<_> = fixtures
+        .iter()
+        .map(|(addr, ..)| addr.port().to_string())
+        .collect();
+    for (addr, protocol, flag, family) in &fixtures {
+        let output = binary()
+            .args(&ports)
+            .args(["--json", flag, family])
+            .output()
+            .unwrap();
+        assert!(
+            matches!(output.status.code(), Some(0 | 3)),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let rows = report["sockets"].as_array().unwrap();
+        assert!(rows.iter().all(|row| {
+            row["protocol"] == *protocol
+                && row["local_addr"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<std::net::IpAddr>()
+                    .unwrap()
+                    .is_ipv4()
+                    == addr.is_ipv4()
+        }));
+        assert!(
+            rows.iter().any(|row| {
+                row["local_port"] == addr.port()
+                    && row["local_addr"] == addr.ip().to_string()
+                    && row["owners"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|owner| owner["pid"] == std::process::id())
+            }),
+            "owned {protocol} endpoint {addr} missing: {report}"
+        );
+    }
 }
 
 #[test]
@@ -160,6 +240,10 @@ mod interactive {
         }
 
         fn run(&mut self, answer: &[u8]) -> Output {
+            self.run_with(answer, &[])
+        }
+
+        fn run_with(&mut self, answer: &[u8], options: &[&str]) -> Output {
             assert!(matches!(answer, b"y\n" | b"n\n" | b""));
             assert!(
                 self.child.try_wait().unwrap().is_none(),
@@ -173,6 +257,7 @@ mod interactive {
                     "--timeout".into(),
                     "1".into(),
                 ])
+                .args(options)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -449,5 +534,87 @@ mod interactive {
             return;
         }
         panic!("could not reserve TCP and UDP fixtures at the same port");
+    }
+
+    #[test]
+    fn filtered_termination_preserves_same_port_udp_and_filters_the_final_scan() {
+        for _ in 0..10 {
+            let mut target = OwnedListener::new();
+            let Some(mut other) = OwnedListener::spawn("UDP", target.port) else {
+                continue;
+            };
+            let output = target.run_with(b"y\n", &["--tcp", "-4"]);
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                matches!(output.status.code(), Some(0 | 1 | 3)),
+                "{diagnostic}"
+            );
+            assert!(target.child.try_wait().unwrap().is_some());
+            assert!(
+                other.child.try_wait().unwrap().is_none(),
+                "excluded UDP owner was terminated"
+            );
+            assert!(
+                !diagnostic.contains(&format!("(PID {})?", other.child.id())),
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains(&format!("PID {} exited (verified)", target.child.id())),
+                "{diagnostic}"
+            );
+            // Both the initial table and final result must respect the filter.
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("UDP"));
+            assert!(TcpListener::bind(("127.0.0.1", target.port)).is_ok());
+            return;
+        }
+        panic!("could not reserve TCP and UDP fixtures at the same port");
+    }
+
+    #[test]
+    fn requested_details_describe_the_owned_child() {
+        let target = OwnedListener::new();
+        let output = binary()
+            .arg(target.port.to_string())
+            .args(["--tcp", "-4", "--details", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            matches!(output.status.code(), Some(0 | 3)),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let owner = report["sockets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row["owners"].as_array().unwrap())
+            .find(|owner| owner["pid"] == target.child.id())
+            .expect("owned child missing");
+        let details = &owner["details"];
+        assert_eq!(
+            details["executable"],
+            std::env::current_exe().unwrap().to_str().unwrap()
+        );
+        let args = details["command"].as_array().expect("command unavailable");
+        assert_eq!(
+            &args[1..],
+            [
+                "--exact",
+                "interactive::listener_helper",
+                "--ignored",
+                "--nocapture"
+            ]
+        );
+        assert_eq!(details["parent_pid"], std::process::id());
+        assert!(!details["user"]["id"].as_str().unwrap().is_empty());
+        let started = details["start_time_unix_ms"].as_u64().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        // Linux boot-time source has second precision; allow that rounding.
+        assert!(u128::from(started) <= now && now - u128::from(started) < 60_000);
+        assert_eq!(details["warnings"], serde_json::json!([]));
     }
 }

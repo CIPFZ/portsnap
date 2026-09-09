@@ -1,10 +1,11 @@
 use crate::model::{
-    OwnershipStatus, ProcessInfo, Protocol, ScanOptions, ScanReport, SocketInfo, TcpState,
+    AddressFamily, DiagnosticCode, OwnershipStatus, ProcessInfo, Protocol, ScanOptions, ScanReport,
+    SocketInfo, TcpState,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use procfs::{net, FromReadSI};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs, io,
     net::SocketAddr,
     path::Path,
@@ -29,42 +30,34 @@ pub(super) fn scan(options: &ScanOptions) -> Result<ScanReport> {
         match collect_owners(Path::new("/proc"), &targets, crate::process::inspect) {
             Ok(found) => index = found,
             Err(error) => {
-                report.warn("/proc", format!("Cannot enumerate process owners: {error}"));
+                report.warn(
+                    DiagnosticCode::from_io(&error),
+                    "/proc",
+                    format!("Cannot enumerate process owners: {error}"),
+                );
                 index.issues.record(&error);
             }
         }
-        if index.issues.permission_denied != 0 || index.issues.other != 0 {
+        for (&code, &count) in &index.issues.0 {
             report.warn(
+                code,
                 "/proc/*/fd",
-                format!(
-                    "Owner lookup was incomplete: {} permission denials and {} other read errors",
-                    index.issues.permission_denied, index.issues.other
-                ),
-            );
-        }
-        if index.issues.changed_owners != 0 {
-            report.warn(
-                "/proc/*/fd",
-                format!(
-                    "{} process owner observation(s) changed during the scan",
-                    index.issues.changed_owners
-                ),
+                format!("Owner lookup was incomplete: {count} {code:?} observation(s)"),
             );
         }
         // hidepid can omit whole processes without returning a permission error.
         if fs::read_to_string("/proc/self/mountinfo")
             .is_ok_and(|mounts| has_hidden_processes(&mounts))
         {
-            index.issues.other += 1;
+            index.issues.increment(DiagnosticCode::VisibilityLimited);
             report.warn(
+                DiagnosticCode::VisibilityLimited,
                 "/proc",
                 "The procfs hidepid setting can hide additional socket owners",
             );
         }
     }
-    let incomplete = index.issues.permission_denied != 0
-        || index.issues.other != 0
-        || index.issues.changed_owners != 0;
+    let incomplete = !index.issues.0.is_empty();
     let mut unknown = 0;
     for mut record in records {
         record.socket.owners = index.owners.get(&record.inode).cloned().unwrap_or_default();
@@ -83,6 +76,7 @@ pub(super) fn scan(options: &ScanOptions) -> Result<ScanReport> {
     }
     if unknown != 0 {
         report.warn(
+            DiagnosticCode::OwnerUnavailable,
             "/proc/*/fd",
             format!(
                 "Could not resolve owners for {unknown} socket(s); access restrictions or sockets changing during the scan can cause this"
@@ -99,12 +93,15 @@ fn read_tables(
 ) -> Result<Vec<SocketRecord>> {
     let mut records = Vec::new();
     let mut readable = 0;
-    for (name, protocol) in [
-        ("tcp", Protocol::Tcp),
-        ("tcp6", Protocol::Tcp),
-        ("udp", Protocol::Udp),
-        ("udp6", Protocol::Udp),
+    for (name, protocol, family) in [
+        ("tcp", Protocol::Tcp, AddressFamily::Ipv4),
+        ("tcp6", Protocol::Tcp, AddressFamily::Ipv6),
+        ("udp", Protocol::Udp, AddressFamily::Ipv4),
+        ("udp6", Protocol::Udp, AddressFamily::Ipv6),
     ] {
+        if !options.allows(protocol, family) {
+            continue;
+        }
         let path = root.join(name);
         match read_table(&path, protocol) {
             Ok(entries) => {
@@ -115,12 +112,16 @@ fn read_tables(
                         .filter(|entry| options.matches(&entry.socket)),
                 );
             }
-            Err(error) => report.warn(path.display().to_string(), format!("{error:#}")),
+            Err(error) => report.warn(
+                DiagnosticCode::from_io(&error),
+                path.display().to_string(),
+                error.to_string(),
+            ),
         }
     }
     if readable == 0 {
         bail!(
-            "Cannot read any TCP/UDP socket table: {}",
+            "Cannot read any requested TCP/UDP socket table: {}",
             report
                 .warnings
                 .iter()
@@ -132,16 +133,20 @@ fn read_tables(
     Ok(records)
 }
 
-fn read_table(path: &Path, protocol: Protocol) -> Result<Vec<SocketRecord>> {
-    let data = fs::read_to_string(path).context("Cannot read socket table")?;
+fn read_table(path: &Path, protocol: Protocol) -> io::Result<Vec<SocketRecord>> {
+    let data = fs::read_to_string(path)?;
     // procfs skips the first line unconditionally; reject empty/truncated input here.
     let header = data.lines().next().unwrap_or_default();
     if !header.contains("local_address") || !header.contains("inode") {
-        bail!("Socket table has a missing or invalid header");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Socket table has a missing or invalid header",
+        ));
     }
     let system = procfs::current_system_info();
     match protocol {
-        Protocol::Tcp => Ok(net::TcpNetEntries::from_read(data.as_bytes(), system)?
+        Protocol::Tcp => Ok(net::TcpNetEntries::from_read(data.as_bytes(), system)
+            .map_err(procfs_error)?
             .0
             .into_iter()
             .map(|entry| {
@@ -154,7 +159,8 @@ fn read_table(path: &Path, protocol: Protocol) -> Result<Vec<SocketRecord>> {
                 )
             })
             .collect()),
-        Protocol::Udp => Ok(net::UdpNetEntries::from_read(data.as_bytes(), system)?
+        Protocol::Udp => Ok(net::UdpNetEntries::from_read(data.as_bytes(), system)
+            .map_err(procfs_error)?
             .0
             .into_iter()
             .map(|entry| {
@@ -168,6 +174,19 @@ fn read_table(path: &Path, protocol: Protocol) -> Result<Vec<SocketRecord>> {
             })
             .collect()),
     }
+}
+
+fn procfs_error(error: procfs::ProcError) -> io::Error {
+    use procfs::ProcError;
+    let kind = match &error {
+        ProcError::PermissionDenied(_) => io::ErrorKind::PermissionDenied,
+        ProcError::NotFound(_) => io::ErrorKind::NotFound,
+        ProcError::Io(error, _) => error.kind(),
+        ProcError::Incomplete(_) | ProcError::Other(_) | ProcError::InternalError(_) => {
+            io::ErrorKind::InvalidData
+        }
+    };
+    io::Error::new(kind, error)
 }
 
 fn record(
@@ -212,19 +231,17 @@ fn tcp_state(state: net::TcpState) -> TcpState {
 }
 
 #[derive(Default)]
-struct AccessIssues {
-    permission_denied: usize,
-    other: usize,
-    changed_owners: usize,
-}
+struct AccessIssues(BTreeMap<DiagnosticCode, usize>);
 
 impl AccessIssues {
+    fn increment(&mut self, code: DiagnosticCode) {
+        *self.0.entry(code).or_default() += 1;
+    }
+
     fn record(&mut self, error: &io::Error) {
-        match error.kind() {
-            io::ErrorKind::NotFound => {} // Processes and FDs routinely disappear.
-            io::ErrorKind::PermissionDenied => self.permission_denied += 1,
-            _ if error.raw_os_error() == Some(libc::ESRCH) => {}
-            _ => self.other += 1,
+        // Unrelated processes and descriptors routinely disappear during traversal.
+        if error.kind() != io::ErrorKind::NotFound && error.raw_os_error() != Some(libc::ESRCH) {
+            self.increment(DiagnosticCode::from_io(error));
         }
     }
 }
@@ -295,14 +312,19 @@ fn collect_owners(
         let after = match inspect(pid) {
             Ok(process) => process,
             Err(error) => {
-                index.issues.record(&error);
-                index.issues.changed_owners += 1;
+                index.issues.increment(super::process_error_code(&error));
                 continue;
             }
         };
         // Never attach FD observations to an identity read only after a PID reuse.
         if before.identity.is_none() || before.identity != after.identity {
-            index.issues.changed_owners += 1;
+            index
+                .issues
+                .increment(if before.identity.is_some() && after.identity.is_some() {
+                    DiagnosticCode::ProcessChanged
+                } else {
+                    DiagnosticCode::ProcessUnverified
+                });
             continue;
         }
         for inode in held {
@@ -377,6 +399,7 @@ mod tests {
             pid,
             name: Some(format!("process-{pid}")),
             identity: Some(ProcessIdentity { pid, start_time }),
+            details: None,
         }
     }
 
@@ -441,13 +464,15 @@ mod tests {
             assert_eq!(entry.remote_port, Some(53));
             assert!(ScanOptions {
                 ports: vec![5353],
-                listening_only: false
+                listening_only: false,
+                ..Default::default()
             }
             .matches(&entry));
             assert_eq!(
                 ScanOptions {
                     ports: vec![5353],
-                    listening_only: true
+                    listening_only: true,
+                    ..Default::default()
                 }
                 .matches(&entry),
                 protocol == Protocol::Udp
@@ -490,7 +515,10 @@ mod tests {
         })
         .unwrap();
         assert!(index.owners.is_empty());
-        assert_eq!(index.issues.changed_owners, 1);
+        assert_eq!(
+            index.issues.0.get(&DiagnosticCode::ProcessChanged),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -505,8 +533,16 @@ mod tests {
                 Err(io::Error::from(kind))
             })
             .unwrap();
-            assert_eq!(index.issues.permission_denied, expected);
-            assert_eq!(index.issues.other, 0);
+            assert_eq!(
+                index
+                    .issues
+                    .0
+                    .get(&DiagnosticCode::PermissionDenied)
+                    .copied()
+                    .unwrap_or(0),
+                expected
+            );
+            assert_eq!(index.issues.0.len(), expected);
         }
     }
 
@@ -521,5 +557,77 @@ mod tests {
         assert!(!has_hidden_processes(
             "22 1 0:20 / /elsewhere rw - proc proc rw,hidepid=2\n"
         ));
+    }
+    #[test]
+    fn unrequested_missing_or_malformed_tables_do_not_affect_completeness() {
+        for (name, protocol, family) in [
+            ("tcp", Protocol::Tcp, AddressFamily::Ipv4),
+            ("tcp6", Protocol::Tcp, AddressFamily::Ipv6),
+            ("udp", Protocol::Udp, AddressFamily::Ipv4),
+            ("udp6", Protocol::Udp, AddressFamily::Ipv6),
+        ] {
+            let fixture = Fixture::new();
+            fixture.table(name, "");
+            let options = ScanOptions {
+                protocol: Some(protocol),
+                family: Some(family),
+                ..Default::default()
+            };
+            let mut report = ScanReport::new();
+            assert!(read_tables(&fixture.0, &options, &mut report)
+                .unwrap()
+                .is_empty());
+            assert!(report.complete);
+            assert!(report.warnings.is_empty());
+            fs::write(fixture.0.join(name), "bad header").unwrap();
+            assert!(read_tables(&fixture.0, &options, &mut report).is_err());
+            assert_eq!(report.warnings.len(), 1);
+            assert_eq!(report.warnings[0].code, DiagnosticCode::InvalidData);
+        }
+    }
+
+    #[test]
+    fn table_diagnostics_distinguish_missing_and_malformed_sources() {
+        let fixture = Fixture::new();
+        fixture.table("tcp", "");
+        fs::write(fixture.0.join("tcp6"), "malformed").unwrap();
+        fixture.table("udp", "bad row\n");
+        let mut report = ScanReport::new();
+        read_tables(&fixture.0, &ScanOptions::default(), &mut report).unwrap();
+        assert_eq!(report.warnings.len(), 3);
+        for warning in &report.warnings {
+            let expected = if warning.source.ends_with("udp6") {
+                DiagnosticCode::SourceUnavailable
+            } else {
+                DiagnosticCode::InvalidData
+            };
+            assert_eq!(warning.code, expected);
+        }
+        assert_eq!(
+            DiagnosticCode::from_io(&procfs_error(procfs::ProcError::PermissionDenied(None))),
+            DiagnosticCode::PermissionDenied
+        );
+        assert_eq!(
+            DiagnosticCode::from_io(&procfs_error(procfs::ProcError::Incomplete(None))),
+            DiagnosticCode::InvalidData
+        );
+    }
+
+    #[test]
+    fn owner_disappearing_after_fd_observation_reports_process_exited() {
+        let fixture = Fixture::new();
+        fixture.fd(10, 3, 123);
+        let mut calls = 0;
+        let index = collect_owners(&fixture.0, &HashSet::from([123]), |pid| {
+            calls += 1;
+            if calls == 1 {
+                Ok(process(pid, 100))
+            } else {
+                Err(io::Error::from_raw_os_error(libc::ESRCH))
+            }
+        })
+        .unwrap();
+        assert!(index.owners.is_empty());
+        assert_eq!(index.issues.0.get(&DiagnosticCode::ProcessExited), Some(&1));
     }
 }

@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use portsnap::{
-    model::{Protocol, ScanOptions, TcpState},
+    model::{AddressFamily, Protocol, ScanOptions, TcpState},
     scanner::Scanner,
 };
 use std::{
@@ -28,6 +28,7 @@ fn real_ipv4_tcp_udp_and_established_client_are_visible() {
     let options = ScanOptions {
         ports: vec![address.port(), client_address.port(), udp_address.port()],
         listening_only: false,
+        ..Default::default()
     };
     let report = Scanner::scan(&options).unwrap();
     let owned = |socket: &&portsnap::model::SocketInfo| {
@@ -104,6 +105,7 @@ fn real_ipv6_tcp_and_udp_keep_the_bound_address() {
             udp.local_addr().unwrap().port(),
         ],
         listening_only: true,
+        ..Default::default()
     })
     .unwrap();
     for (protocol, address) in [
@@ -174,6 +176,7 @@ fn inherited_socket_reports_both_process_owners() {
     let report = Scanner::scan(&ScanOptions {
         ports: vec![port],
         listening_only: true,
+        ..Default::default()
     })
     .unwrap();
     let socket = report
@@ -207,4 +210,60 @@ fn inherited_socket_helper() {
     std::io::stdout().flush().unwrap();
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).unwrap();
+}
+
+#[test]
+fn protocol_and_family_filters_scope_real_bound_sockets() {
+    let tcp4 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = tcp4.local_addr().unwrap().port();
+    let udp4 = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+    for protocol in [Protocol::Tcp, Protocol::Udp] {
+        let report = Scanner::scan(&ScanOptions {
+            ports: vec![port],
+            protocol: Some(protocol),
+            family: Some(AddressFamily::Ipv4),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!report.sockets.is_empty());
+        assert!(report
+            .sockets
+            .iter()
+            .all(|socket| socket.protocol == protocol
+                && socket.local_addr.is_ipv4()
+                && socket.local_port == port));
+        assert!(report.sockets.iter().any(|socket| socket
+            .owners
+            .iter()
+            .any(|owner| owner.pid == std::process::id())));
+    }
+    drop(udp4);
+    let tcp6 = match TcpListener::bind("[::1]:0") {
+        Ok(listener) => listener,
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)
+            ) =>
+        {
+            return
+        }
+        Err(error) => panic!("IPv6 bind failed: {error}"),
+    };
+    let udp6 = UdpSocket::bind(tcp6.local_addr().unwrap()).unwrap();
+    for protocol in [Protocol::Tcp, Protocol::Udp] {
+        let report = Scanner::scan(&ScanOptions {
+            ports: vec![tcp6.local_addr().unwrap().port()],
+            protocol: Some(protocol),
+            family: Some(AddressFamily::Ipv6),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!report.sockets.is_empty());
+        assert!(report
+            .sockets
+            .iter()
+            .all(|socket| socket.protocol == protocol && socket.local_addr.is_ipv6()));
+    }
+    drop(udp6);
 }

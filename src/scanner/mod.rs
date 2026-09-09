@@ -1,4 +1,4 @@
-use crate::model::{OwnershipStatus, ScanOptions, ScanReport, SocketInfo};
+use crate::model::{DiagnosticCode, OwnershipStatus, ScanOptions, ScanReport, SocketInfo};
 use anyhow::Result;
 use std::collections::BTreeMap;
 
@@ -11,36 +11,39 @@ mod windows;
 
 pub struct Scanner;
 
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
+/// Keep diagnostics bounded by category/source, regardless of socket count.
 #[derive(Default)]
-struct MetadataWarnings(BTreeMap<&'static str, (usize, Vec<String>)>);
+struct WarningSummary(BTreeMap<(DiagnosticCode, &'static str), (usize, Vec<String>)>);
 
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-impl MetadataWarnings {
-    fn record(&mut self, class: &'static str, pid: u32, detail: &str) {
-        let (count, examples) = self.0.entry(class).or_default();
+impl WarningSummary {
+    fn record(&mut self, code: DiagnosticCode, source: &'static str, detail: impl AsRef<str>) {
+        let (count, examples) = self.0.entry((code, source)).or_default();
         *count += 1;
         if examples.len() < 3 {
-            let example = if detail.is_empty() {
-                format!("PID {pid}")
-            } else {
-                format!("PID {pid}: {detail}")
-            };
-            examples.push(example.chars().take(180).collect());
+            examples.push(detail.as_ref().chars().take(180).collect());
         }
     }
 
     fn append_to(self, report: &mut ScanReport) {
-        for (class, (count, examples)) in self.0 {
+        for ((code, source), (count, examples)) in self.0 {
             report.warn(
-                "process metadata",
-                format!(
-                    "{count} process(es) {class}; examples: {}",
-                    examples.join("; ")
-                ),
+                code,
+                source,
+                format!("{count} observation(s); examples: {}", examples.join("; ")),
             );
         }
     }
+}
+
+fn process_error_code(error: &std::io::Error) -> DiagnosticCode {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return DiagnosticCode::ProcessExited;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return DiagnosticCode::ProcessExited;
+    }
+    DiagnosticCode::from_io(error)
 }
 
 /// Socket APIs expose numeric PIDs, so take process identities before the
@@ -68,38 +71,46 @@ fn scan_with_verified_owners(
         .flat_map(|socket| socket.owners.iter().map(|owner| owner.pid))
         .collect();
     let mut verified: BTreeMap<u32, ProcessInfo> = BTreeMap::new();
-    let mut warnings = MetadataWarnings::default();
+    let mut warnings = WarningSummary::default();
     for pid in pids {
-        let (class, detail) = match before.get(&pid) {
+        let (code, detail) = match before.get(&pid) {
             Some(Ok(previous)) => match inspect(pid) {
                 Ok(current)
                     if current.identity.is_some() && current.identity == previous.identity =>
                 {
                     if current.name.is_none() {
-                        warnings.record("had no readable process name", pid, "");
+                        warnings.record(
+                            DiagnosticCode::MetadataUnavailable,
+                            "process metadata",
+                            format!("PID {pid}: no readable process name"),
+                        );
                     }
                     verified.insert(pid, current);
                     continue;
                 }
-                Ok(_) => (
-                    "changed identity or had no verifiable identity",
-                    String::new(),
+                Ok(current) => (
+                    if current.identity.is_some() && previous.identity.is_some() {
+                        DiagnosticCode::ProcessChanged
+                    } else {
+                        DiagnosticCode::ProcessUnverified
+                    },
+                    "identity changed or could not be verified".to_owned(),
                 ),
                 Err(error) => (
-                    "could not be verified after the socket snapshot",
-                    error.to_string(),
+                    process_error_code(&error),
+                    format!("verification after snapshot: {error}"),
                 ),
             },
             Some(Err(error)) => (
-                "had unreadable identities before the socket snapshot",
-                error.to_string(),
+                process_error_code(error),
+                format!("identity before snapshot: {error}"),
             ),
             None => (
-                "appeared during the scan and could not be verified",
-                String::new(),
+                DiagnosticCode::ProcessUnverified,
+                "appeared during scan without a prior identity".to_owned(),
             ),
         };
-        warnings.record(class, pid, &detail);
+        warnings.record(code, "process metadata", format!("PID {pid}: {detail}"));
     }
     warnings.append_to(&mut report);
     for socket in &mut report.sockets {
@@ -160,15 +171,22 @@ fn normalize(mut report: ScanReport, options: &ScanOptions) -> ScanReport {
             endpoints.insert(key, socket);
         }
     }
+    let mut warnings = WarningSummary::default();
     for mut socket in endpoints.into_values() {
         let mut owners = BTreeMap::new();
         for owner in std::mem::take(&mut socket.owners) {
             if let Some(existing) = owners.get_mut(&owner.pid) {
                 let existing: &mut crate::model::ProcessInfo = existing;
                 if existing.identity != owner.identity {
+                    let code = if existing.identity.is_some() && owner.identity.is_some() {
+                        DiagnosticCode::ProcessChanged
+                    } else {
+                        DiagnosticCode::ProcessUnverified
+                    };
                     existing.identity = None;
                     socket.ownership = OwnershipStatus::Partial;
-                    report.warn(
+                    warnings.record(
+                        code,
                         "process identity",
                         format!(
                             "PID {} changed or could not be verified during the scan",
@@ -186,9 +204,10 @@ fn normalize(mut report: ScanReport, options: &ScanOptions) -> ScanReport {
         socket.owners = owners.into_values().collect();
         report.sockets.push(socket);
     }
+    warnings.append_to(&mut report);
     report
         .warnings
-        .sort_by(|a, b| (&a.source, &a.message).cmp(&(&b.source, &b.message)));
+        .sort_by(|a, b| (a.code, &a.source, &a.message).cmp(&(b.code, &b.source, &b.message)));
     report.warnings.dedup();
     report
 }
@@ -224,6 +243,7 @@ mod tests {
                 pid,
                 name: Some("worker".into()),
                 identity: Some(ProcessIdentity { pid, start_time: 7 }),
+                details: None,
             }],
         }
     }
@@ -268,6 +288,7 @@ mod tests {
             &ScanOptions {
                 ports: vec![8080],
                 listening_only: true,
+                ..Default::default()
             },
         );
         assert_eq!(result.sockets.len(), 1);
@@ -292,6 +313,7 @@ mod tests {
                         pid,
                         start_time: calls.get(),
                     }),
+                    details: None,
                 })
             },
         )
@@ -356,7 +378,8 @@ mod tests {
         assert_eq!(report.warnings.len(), 1);
         let warning = &report.warnings[0];
         assert_eq!(warning.source, "process metadata");
-        assert!(warning.message.contains("200 process(es)"));
+        assert_eq!(warning.code, DiagnosticCode::PermissionDenied);
+        assert!(warning.message.contains("200 observation(s)"));
         assert!(warning.message.contains("access denied"));
         assert_eq!(warning.message.matches("PID ").count(), 3);
         assert!(warning.message.len() < 1024);
@@ -365,5 +388,92 @@ mod tests {
             .iter()
             .all(|socket| socket.ownership == OwnershipStatus::Partial
                 && socket.owners[0].identity.is_none()));
+    }
+    #[test]
+    fn common_filters_keep_only_requested_protocol_and_native_family() {
+        use crate::model::AddressFamily;
+        let mut tcp4 = socket(1);
+        tcp4.local_port = 53;
+        let mut udp4 = tcp4.clone();
+        udp4.protocol = Protocol::Udp;
+        udp4.state = None;
+        let mut tcp6 = tcp4.clone();
+        tcp6.local_addr = "::ffff:127.0.0.1".parse().unwrap();
+        let mut udp6 = udp4.clone();
+        udp6.local_addr = "::1".parse().unwrap();
+        let mut report = ScanReport::new();
+        report.sockets = vec![tcp4, udp4, tcp6, udp6];
+        for protocol in [Protocol::Tcp, Protocol::Udp] {
+            for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
+                let result = normalize(
+                    report.clone(),
+                    &ScanOptions {
+                        ports: vec![53],
+                        protocol: Some(protocol),
+                        family: Some(family),
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(result.sockets.len(), 1);
+                assert_eq!(result.sockets[0].protocol, protocol);
+                assert_eq!(
+                    result.sockets[0].local_addr.is_ipv6(),
+                    family == AddressFamily::Ipv6
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warnings_keep_distinct_codes_and_deduplicate_identical_diagnostics() {
+        let mut report = ScanReport::new();
+        for code in [
+            DiagnosticCode::PermissionDenied,
+            DiagnosticCode::SourceUnavailable,
+            DiagnosticCode::PermissionDenied,
+        ] {
+            report.warn(code, "source", "same message");
+        }
+        let report = normalize(report, &ScanOptions::default());
+        assert_eq!(report.warnings.len(), 2);
+        assert_eq!(report.warnings[0].code, DiagnosticCode::PermissionDenied);
+        assert_eq!(report.warnings[1].code, DiagnosticCode::SourceUnavailable);
+    }
+
+    #[test]
+    fn owner_verification_classifies_native_errors_and_identity_absence() {
+        for (kind, code) in [
+            (
+                std::io::ErrorKind::PermissionDenied,
+                DiagnosticCode::PermissionDenied,
+            ),
+            (std::io::ErrorKind::NotFound, DiagnosticCode::ProcessExited),
+            (std::io::ErrorKind::InvalidData, DiagnosticCode::InvalidData),
+        ] {
+            let report = scan_with_verified_owners(
+                || {
+                    let mut report = ScanReport::new();
+                    report.sockets.push(socket(20));
+                    Ok(report)
+                },
+                |_| Err(std::io::Error::new(kind, "identical wording")),
+            )
+            .unwrap();
+            assert_eq!(report.warnings[0].code, code);
+        }
+        let report = scan_with_verified_owners(
+            || {
+                let mut report = ScanReport::new();
+                report.sockets.push(socket(20));
+                Ok(report)
+            },
+            |pid| {
+                let mut owner = socket(pid).owners.remove(0);
+                owner.identity = None;
+                Ok(owner)
+            },
+        )
+        .unwrap();
+        assert_eq!(report.warnings[0].code, DiagnosticCode::ProcessUnverified);
     }
 }

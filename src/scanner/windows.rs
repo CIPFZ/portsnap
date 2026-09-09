@@ -1,8 +1,10 @@
 use crate::model::{
-    OwnershipStatus, ProcessInfo, Protocol, ScanOptions, ScanReport, SocketInfo, TcpState,
+    AddressFamily, DiagnosticCode, OwnershipStatus, ProcessInfo, Protocol, ScanOptions, ScanReport,
+    SocketInfo, TcpState,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Result};
 use std::{
+    io,
     mem::{offset_of, size_of},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
@@ -22,26 +24,46 @@ pub(super) fn scan(options: &ScanOptions) -> Result<ScanReport> {
 }
 
 fn snapshot(options: &ScanOptions) -> Result<ScanReport> {
+    snapshot_with(options, table)
+}
+
+fn snapshot_with(
+    options: &ScanOptions,
+    mut query: impl FnMut(Protocol, u16) -> io::Result<Vec<SocketInfo>>,
+) -> Result<ScanReport> {
     let mut report = ScanReport::new();
     let mut successful_tables = 0;
+    let mut warnings = super::WarningSummary::default();
     for (protocol, family, source) in [
         (Protocol::Tcp, AF_INET, "TCP IPv4"),
         (Protocol::Tcp, AF_INET6, "TCP IPv6"),
         (Protocol::Udp, AF_INET, "UDP IPv4"),
         (Protocol::Udp, AF_INET6, "UDP IPv6"),
     ] {
-        match table(protocol, family) {
+        if !options.allows(
+            protocol,
+            if family == AF_INET {
+                AddressFamily::Ipv4
+            } else {
+                AddressFamily::Ipv6
+            },
+        ) {
+            continue;
+        }
+        match query(protocol, family) {
             Ok(sockets) => {
                 successful_tables += 1;
                 for socket in sockets.into_iter().filter(|socket| options.matches(socket)) {
                     if socket.ownership == OwnershipStatus::Unavailable {
-                        report.warn(
+                        warnings.record(
+                            DiagnosticCode::OwnerUnavailable,
                             source,
                             format!("owner unavailable for local port {}", socket.local_port),
                         );
                     }
                     if socket.state == Some(TcpState::Unknown) {
-                        report.warn(
+                        warnings.record(
+                            DiagnosticCode::UnknownState,
                             source,
                             format!(
                                 "unrecognized TCP state for local port {}",
@@ -52,12 +74,13 @@ fn snapshot(options: &ScanOptions) -> Result<ScanReport> {
                     report.sockets.push(socket);
                 }
             }
-            Err(error) => report.warn(source, error.to_string()),
+            Err(error) => report.warn(DiagnosticCode::from_io(&error), source, error.to_string()),
         }
     }
+    warnings.append_to(&mut report);
     if successful_tables == 0 {
         bail!(
-            "all Windows socket tables failed: {}",
+            "all requested Windows socket tables failed: {}",
             report
                 .warnings
                 .iter()
@@ -69,7 +92,7 @@ fn snapshot(options: &ScanOptions) -> Result<ScanReport> {
     Ok(report)
 }
 
-fn table(protocol: Protocol, family: u16) -> Result<Vec<SocketInfo>> {
+fn table(protocol: Protocol, family: u16) -> io::Result<Vec<SocketInfo>> {
     let (buffer, byte_len) = read_table(|pointer, size| {
         // SAFETY: read_table supplies a null size-probe pointer or an aligned
         // writable allocation with at least *size bytes, alive for this call.
@@ -126,48 +149,66 @@ fn table(protocol: Protocol, family: u16) -> Result<Vec<SocketInfo>> {
             .into_iter()
             .map(udp6)
             .collect()),
-            _ => bail!("unsupported Windows address family {family}"),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("unsupported Windows address family {family}"),
+            )),
         }
     }
 }
 
 fn read_table(
     mut query: impl FnMut(*mut std::ffi::c_void, &mut u32) -> u32,
-) -> Result<(Vec<u64>, usize)> {
+) -> io::Result<(Vec<u64>, usize)> {
     let mut size = 0;
     let status = query(std::ptr::null_mut(), &mut size);
     if status != ERROR_INSUFFICIENT_BUFFER && status != NO_ERROR {
-        return Err(std::io::Error::from_raw_os_error(status as i32).into());
+        return Err(io::Error::from_raw_os_error(status as i32));
     }
     for _ in 0..4 {
         if size < size_of::<u32>() as u32 {
-            bail!("Windows returned an invalid socket table size {size}");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Windows returned an invalid socket table size {size}"),
+            ));
         }
         let capacity = (size as usize).div_ceil(size_of::<u64>());
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(capacity)
-            .context("cannot allocate Windows socket table")?;
+            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
         buffer.resize(capacity, 0_u64);
         let status = query(buffer.as_mut_ptr().cast(), &mut size);
         if status == ERROR_INSUFFICIENT_BUFFER {
             continue;
         }
         if status != NO_ERROR {
-            return Err(std::io::Error::from_raw_os_error(status as i32).into());
+            return Err(io::Error::from_raw_os_error(status as i32));
         }
         if size as usize > buffer.len() * size_of::<u64>() {
-            bail!("Windows returned a table larger than its allocation");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows returned a table larger than its allocation",
+            ));
         }
         return Ok((buffer, size as usize));
     }
-    bail!("Windows socket table kept growing during the scan; retry the query")
+    Err(io::Error::other(
+        "Windows socket table kept growing during the scan; retry the query",
+    ))
 }
 
 /// T must be the SDK integer-only row type associated with the requested table.
-unsafe fn decode_rows<T: Copy>(buffer: &[u64], byte_len: usize, offset: usize) -> Result<Vec<T>> {
+unsafe fn decode_rows<T: Copy>(
+    buffer: &[u64],
+    byte_len: usize,
+    offset: usize,
+) -> io::Result<Vec<T>> {
     if byte_len < size_of::<u32>() || byte_len > std::mem::size_of_val(buffer) {
-        bail!("truncated Windows socket table header");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated Windows socket table header",
+        ));
     }
     // SAFETY: the bounds above include a full u32, and unaligned reads do not
     // assume the alignment of the byte offset into the native table.
@@ -176,9 +217,17 @@ unsafe fn decode_rows<T: Copy>(buffer: &[u64], byte_len: usize, offset: usize) -
     let rows_len = count
         .checked_mul(size_of::<T>())
         .and_then(|len| offset.checked_add(len))
-        .ok_or_else(|| anyhow!("Windows socket table row count overflow"))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows socket table row count overflow",
+            )
+        })?;
     if rows_len > byte_len {
-        bail!("truncated Windows socket table rows");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated Windows socket table rows",
+        ));
     }
     let mut rows = Vec::with_capacity(count);
     for index in 0..count {
@@ -217,6 +266,7 @@ fn owner_socket(
                 pid,
                 name: None,
                 identity: None,
+                details: None,
             }]
         },
         ownership: if pid == 0 {
@@ -396,5 +446,85 @@ mod tests {
         assert_eq!(len, 8);
         assert_eq!(buffer, [0]);
         assert!(read_table(|_, _| 5).is_err());
+    }
+    #[test]
+    fn acquisition_skips_unrequested_tables_and_classifies_native_errors() {
+        for (protocol, family, native_family) in [
+            (Protocol::Tcp, AddressFamily::Ipv4, AF_INET),
+            (Protocol::Tcp, AddressFamily::Ipv6, AF_INET6),
+            (Protocol::Udp, AddressFamily::Ipv4, AF_INET),
+            (Protocol::Udp, AddressFamily::Ipv6, AF_INET6),
+        ] {
+            let mut queried = Vec::new();
+            let report = snapshot_with(
+                &ScanOptions {
+                    protocol: Some(protocol),
+                    family: Some(family),
+                    ..Default::default()
+                },
+                |p, f| {
+                    queried.push((p, f));
+                    if (p, f) == (protocol, native_family) {
+                        Ok(Vec::new())
+                    } else {
+                        Err(io::Error::from_raw_os_error(5))
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(queried, [(protocol, native_family)]);
+            assert!(report.complete);
+        }
+        let report = snapshot_with(
+            &ScanOptions {
+                family: Some(AddressFamily::Ipv4),
+                ..Default::default()
+            },
+            |p, _| {
+                if p == Protocol::Tcp {
+                    Ok(Vec::new())
+                } else {
+                    Err(io::Error::from_raw_os_error(5))
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].code, DiagnosticCode::PermissionDenied);
+        assert_eq!(report.warnings[0].source, "UDP IPv4");
+    }
+
+    #[test]
+    fn malformed_tables_and_unknown_owner_warnings_are_structured_and_bounded() {
+        let error = read_table(|_, size| {
+            *size = 1;
+            NO_ERROR
+        })
+        .unwrap_err();
+        assert_eq!(DiagnosticCode::from_io(&error), DiagnosticCode::InvalidData);
+        let report = snapshot_with(
+            &ScanOptions {
+                protocol: Some(Protocol::Tcp),
+                family: Some(AddressFamily::Ipv4),
+                ..Default::default()
+            },
+            |_, _| {
+                Ok((1000_u16..1200)
+                    .map(|port| {
+                        owner_socket(
+                            Protocol::Tcp,
+                            IpAddr::V4(Ipv4Addr::LOCALHOST),
+                            None,
+                            port.to_be().into(),
+                            0,
+                        )
+                    })
+                    .collect())
+            },
+        )
+        .unwrap();
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].code, DiagnosticCode::OwnerUnavailable);
+        assert!(report.warnings[0].message.len() < 1024);
     }
 }

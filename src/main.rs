@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use clap::{ArgGroup, Parser};
 use portsnap::{
     killer::{KillError, KillOutcome, PreparedTarget},
-    model::{ProcessInfo, ScanOptions, ScanReport},
-    output,
+    model::{AddressFamily, ProcessInfo, Protocol, ScanOptions, ScanReport},
+    output, process,
     scanner::Scanner,
 };
 use std::{
@@ -27,6 +27,21 @@ struct Args {
     /// List TCP listeners and bound UDP endpoints
     #[arg(short = 'l', long, conflicts_with = "ports")]
     list: bool,
+    /// Restrict all scans and termination targets to TCP
+    #[arg(long, conflicts_with = "udp")]
+    tcp: bool,
+    /// Restrict all scans and termination targets to UDP
+    #[arg(long, conflicts_with = "tcp")]
+    udp: bool,
+    /// Restrict all scans to IPv4 sockets
+    #[arg(short = '4', long, conflicts_with = "ipv6")]
+    ipv4: bool,
+    /// Restrict all scans to IPv6 sockets (including IPv4-mapped IPv6)
+    #[arg(short = '6', long, conflicts_with = "ipv4")]
+    ipv6: bool,
+    /// Read executable, arguments, user, parent and start time for matching owners
+    #[arg(long)]
+    details: bool,
     /// Emit one versioned JSON scan report
     #[arg(long, conflicts_with = "kill")]
     json: bool,
@@ -68,8 +83,25 @@ fn run(args: Args) -> Result<u8> {
     let options = ScanOptions {
         ports: args.ports,
         listening_only: args.list,
+        protocol: if args.tcp {
+            Some(Protocol::Tcp)
+        } else if args.udp {
+            Some(Protocol::Udp)
+        } else {
+            None
+        },
+        family: if args.ipv4 {
+            Some(AddressFamily::Ipv4)
+        } else if args.ipv6 {
+            Some(AddressFamily::Ipv6)
+        } else {
+            None
+        },
     };
-    let report = Scanner::scan(&options).context("scan failed")?;
+    let mut report = Scanner::scan(&options).context("scan failed")?;
+    if args.details {
+        process::enrich_details(&mut report);
+    }
     if args.json {
         let mut out = io::stdout().lock();
         serde_json::to_writer_pretty(&mut out, &report).context("write JSON report")?;
@@ -84,6 +116,7 @@ fn run(args: Args) -> Result<u8> {
             &options,
             args.force,
             Duration::from_secs(args.timeout),
+            args.details,
         );
     }
     Ok(if report.complete { 0 } else { 3 })
@@ -111,6 +144,7 @@ fn kill_interactively(
     options: &ScanOptions,
     force: bool,
     timeout: Duration,
+    details: bool,
 ) -> Result<u8> {
     let owners = targets(report)?;
     if owners.is_empty() {
@@ -198,7 +232,10 @@ fn kill_interactively(
         }
     }
     if attempted {
-        let remaining = Scanner::scan(options).context("cannot verify remaining endpoints")?;
+        let mut remaining = Scanner::scan(options).context("cannot verify remaining endpoints")?;
+        if details {
+            process::enrich_details(&mut remaining);
+        }
         incomplete |= !remaining.complete;
         output::write_warnings(io::stderr().lock(), &remaining)?;
         if remaining.sockets.is_empty() {
@@ -239,6 +276,10 @@ mod tests {
             vec!["portsnap", "0"],
             vec!["portsnap", "65536"],
             vec!["portsnap", "80", "--timeout", "0"],
+            vec!["portsnap", "80", "--tcp", "--udp"],
+            vec!["portsnap", "--list", "-4", "-6"],
+            vec!["portsnap", "--details"],
+            vec!["portsnap", "--tcp"],
         ] {
             assert!(Args::try_parse_from(&args).is_err(), "{args:?}");
         }
@@ -249,6 +290,9 @@ mod tests {
             vec!["portsnap", "80", "443"],
             vec!["portsnap", "-l", "--json"],
             vec!["portsnap", "80", "-k", "--force", "--timeout", "1"],
+            vec!["portsnap", "80", "--tcp", "-4", "--details", "--json"],
+            vec!["portsnap", "-l", "--udp", "--ipv6", "--details"],
+            vec!["portsnap", "80", "--tcp", "-6", "--kill"],
         ] {
             assert!(Args::try_parse_from(&args).is_ok(), "{args:?}");
         }
